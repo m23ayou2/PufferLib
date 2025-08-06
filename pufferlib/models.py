@@ -9,18 +9,14 @@ import pufferlib.pytorch
 import pufferlib.spaces
 
 
+import torch
+import torch.nn as nn
+import numpy as np
+import pufferlib
+import pufferlib.pytorch
+import pufferlib.spaces
 class Default(nn.Module):
-    '''Default PyTorch policy. Flattens obs and applies a linear layer.
-
-    PufferLib is not a framework. It does not enforce a base class.
-    You can use any PyTorch policy that returns actions and values.
-    We structure our forward methods as encode_observations and decode_actions
-    to make it easier to wrap policies with LSTMs. You can do that and use
-    our LSTM wrapper or implement your own. To port an existing policy
-    for use with our LSTM wrapper, simply put everything from forward() before
-    the recurrent cell into encode_observations and put everything after
-    into decode_actions.
-    '''
+    '''Default DQN policy with Dueling architecture. Flattens obs and applies layers to output Q-values.'''
     def __init__(self, env, hidden_size=128):
         super().__init__()
         self.hidden_size = hidden_size
@@ -36,43 +32,47 @@ class Default(nn.Module):
         if self.is_dict_obs:
             self.dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
             input_size = int(sum(np.prod(v.shape) for v in env.env.observation_space.values()))
-            self.encoder = nn.Linear(input_size, self.hidden_size)
+            self.encoder = nn.Sequential(
+                pufferlib.pytorch.layer_init(nn.Linear(input_size, hidden_size)),
+                nn.ReLU(),
+                pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+                nn.ReLU()
+            )
         else:
             num_obs = np.prod(env.single_observation_space.shape)
             self.encoder = torch.nn.Sequential(
                 pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
-                nn.GELU(),
+                nn.ReLU(),
+                pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+                nn.ReLU()
             )
-            
-        if self.is_multidiscrete:
-            self.action_nvec = tuple(env.single_action_space.nvec)
-            num_atns = sum(self.action_nvec)
-            self.decoder = pufferlib.pytorch.layer_init(
-                    nn.Linear(hidden_size, num_atns), std=0.01)
-        elif not self.is_continuous:
-            num_atns = env.single_action_space.n
-            self.decoder = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, num_atns), std=0.01)
-        else:
-            self.decoder_mean = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, env.single_action_space.shape[0]), std=0.01)
-            self.decoder_logstd = nn.Parameter(torch.zeros(
-                1, env.single_action_space.shape[0]))
 
-        self.value = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 1), std=1)
+        # Only support discrete action spaces for DQN
+        assert not self.is_continuous, "DQN does not support continuous action spaces"
+        assert not self.is_multidiscrete, "DQN does not support multidiscrete action spaces"
+
+        # Dueling DQN heads
+        num_actions = env.single_action_space.n
+        self.value_stream = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1))
+        self.advantage_stream = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, num_actions))
+
+        # Dummy value head (required by PufferLib wrappers, unused in DQN)
+        self.value = nn.Linear(hidden_size, 1)
+
+        self.num_actions = num_actions
 
     def forward_eval(self, observations, state=None):
         hidden = self.encode_observations(observations, state=state)
-        logits, values = self.decode_actions(hidden)
-        return logits, values
+        q_values = self.decode_actions(hidden)
+        return q_values  # Only return Q-values
 
     def forward(self, observations, state=None):
         return self.forward_eval(observations, state)
 
     def encode_observations(self, observations, state=None):
-        '''Encodes a batch of observations into hidden states. Assumes
-        no time dimension (handled by LSTM wrappers).'''
+        '''Encodes a batch of observations into hidden states.'''
         batch_size = observations.shape[0]
         if self.is_dict_obs:
             observations = pufferlib.pytorch.nativize_tensor(observations, self.dtype)
@@ -82,21 +82,20 @@ class Default(nn.Module):
         return self.encoder(observations.float())
 
     def decode_actions(self, hidden):
-        '''Decodes a batch of hidden states into (multi)discrete actions.
-        Assumes no time dimension (handled by LSTM wrappers).'''
-        if self.is_multidiscrete:
-            logits = self.decoder(hidden).split(self.action_nvec, dim=1)
-        elif self.is_continuous:
-            mean = self.decoder_mean(hidden)
-            logstd = self.decoder_logstd.expand_as(mean)
-            std = torch.exp(logstd)
-            logits = torch.distributions.Normal(mean, std)
-        else:
-            logits = self.decoder(hidden)
+        '''Computes Q-values using Dueling DQN architecture.'''
+        # Dueling architecture: Q = V + A - mean(A)
+        value = self.value_stream(hidden)
+        advantages = self.advantage_stream(hidden)
+        q_values = value + (advantages - advantages.mean(dim=1, keepdim=True))
+        
+        # Return fake logits and values to satisfy interface
+        batch_size = hidden.shape[0]
+        fake_logits = torch.zeros(batch_size, 1, device=hidden.device)
+        fake_values = self.value(hidden)  # Dummy value for PufferLib
+        return q_values, fake_values  # Q-values and dummy values
 
-        values = self.value(hidden)
-        return logits, values
 
+        
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, input_size=128, hidden_size=128):
         '''Wraps your policy with an LSTM without letting you shoot yourself in the
