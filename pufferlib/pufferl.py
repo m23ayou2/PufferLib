@@ -72,7 +72,7 @@ OMEGA = 0.01
 CLIP_MIN = -1
 ALPHA = 0.9     # Munchausen alpha
 HORIZON = 500
-MEM_SIZE = 20_000
+MEM_SIZE = 10_000
 NUM_AGENTS = 1
 NROLLS = 10
 
@@ -229,7 +229,7 @@ class PuffeRL:
         self.alpha = OMEGA
         self.horizon = horizon
         self.device = device
-        self.priorities = torch.zeros(self.segments * (horizon)) + BUFFER_EPS
+        self.priorities = torch.zeros(self.segments , horizon).to(self.device) + BUFFER_EPS
         self.criterion = nn.SmoothL1Loss()
 
 
@@ -245,7 +245,7 @@ class PuffeRL:
 
 
 
-
+        self.mean_ = 0
 
 
         # Initializations
@@ -401,17 +401,20 @@ class PuffeRL:
                     self.observations[batch_rows, l] = o
                 else:
                     self.observations[batch_rows, l] = o_device
-                self.priorities.reshape(-1, self.horizon)[batch_rows, l] = self.max_priority
+                #self.priorities[batch_rows, l] = self.max_priority
                 self.actions[batch_rows, l] = action.long()
                 
                 self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = d.float()
                 
                # print(self.ep_lengths.max())
-
+                self.mean_ = torch.mean(self.ep_lengths.float())
                 # Note: We are not yet handling masks in this version
-                self.ep_lengths[env_id] += 1
                 mask = (torch.arange(env_id.stop-env_id.start, device=self.device) + env_id.start)[d.bool() | (self.ep_lengths[env_id] +1  > config['bptt_horizon'])]
+                self.ep_lengths[env_id] += 1
+
+
+
 
                 if mask.any(): 
                     num_full = mask.shape[0]
@@ -514,13 +517,13 @@ class PuffeRL:
             td_errors = torch.abs(state_action_values.squeeze(1) - expected_state_action_values.detach())
 
             # Update priorities
-            self.update_priorities(samples, td_errors.detach().cpu())
+            self.update_priorities(samples, td_errors.detach())
 
             # Optimization step
             
             profile('train_misc', epoch)
             losses['policy_loss'] = loss.item() 
-            losses['max_ep'] = self.ep_lengths.max().item()
+            losses['max_ep'] = self.mean_.item()
 
             # Learn on accumulated minibatches
             profile('learn', epoch)
@@ -532,8 +535,7 @@ class PuffeRL:
             self.optimizer.step()
             self.soft_update()
 
-        if self.step_%5:
-            self.decay_epsilon()
+        self.decay_epsilon()
         
         profile('train_misc', epoch)    
                                         
