@@ -123,13 +123,9 @@ class PuffeRL:
             device='cpu' if config['cpu_offload'] else device)
         self.actions = torch.zeros(self.segments, horizon, *atn_space.shape, device=device,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
-        self.values = torch.zeros(self.segments, horizon, device=device)
-        self.logprobs = torch.zeros(self.segments, horizon, device=device)
         self.rewards = torch.zeros(self.segments, horizon, device=device)
         self.terminals = torch.zeros(self.segments, horizon, device=device)
-        self.truncations = torch.zeros(self.segments, horizon, device=device)
-        self.ratio = torch.ones(self.segments, horizon, device=device)
-        self.importance = torch.ones(self.segments, horizon, device=device)
+        
         self.ep_lengths = torch.zeros(self.segments, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(self.total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
@@ -291,15 +287,15 @@ class PuffeRL:
         samples = torch.multinomial(probs, batch_size, replacement=True)
     
         # Calculate next indices, handling buffer wrap-around
-        n_rows = self.horizon
+        n_row = self.horizon
         n_col = MEM_SIZE
-        min = (self.ep_lengths.reshape(-1,1).expand(n_col, n_row)[samples]
+        min_ = (self.ep_lengths+torch.arange(n_col, device=self.device)*n_col).reshape(-1,1).expand(n_col, n_row).reshape(-1)[samples]
         
         # Update samples using torch.where to get the minimum
-        samples = torch.where(samples < min, samples, min)
+        samples = torch.where(samples < min_, samples, min_)
         
         # Calculate rolls in a similar manner
-        rolls = torch.where(samples + 1 < min, samples + 1, min)
+        rolls = torch.where(samples + 1 < min_, samples + 1, min_)
     
         # Get states and next states
         states = self.observations.view(-1, self.ob_space)[samples]
@@ -315,7 +311,7 @@ class PuffeRL:
         #weights = (len(self.priorities) * probs[indices]) ** (-self.beta)
         #weights = weights / weights.max()
 
-        return states, next_states, dones, actions.unsqueeze(1), rewards, samples, rolls, weights
+        return states, next_states, dones, actions.unsqueeze(1), rewards, samples, rolls #, weights
 
     def update_priorities(self, samples, td_errors):
         # Corrected: Use `index` for episodes and `samples` for timesteps
@@ -478,14 +474,14 @@ class PuffeRL:
         clip_coef = config['clip_coef']
         vf_clip = config['vf_clip_coef']
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
-        self.ratio[:] = 1
+    
 
         for mb in range(self.total_minibatches):
             profile('train_misc', epoch, nest=True)
             self.amp_context.__enter__()
 
 
-            state_batch, next_states, term_, action_batch, returns, index, samples, weights = self.sample(self.minibatch_segments)
+            state_batch, next_states, term_, action_batch, returns, index, samples = self.sample(self.minibatch_segments)
 
             
             profile('train_copy', epoch)
