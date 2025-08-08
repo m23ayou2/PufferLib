@@ -517,8 +517,8 @@ class PuffeRL:
 
             state_action_values = q_values.gather(1, action_batch)
 
-            if non_final_mask.any():
-                with torch.no_grad():
+            with torch.no_grad():
+                if non_final_mask.any():
                     # Double DQN: use main network to select actions, target network to evaluate
                     q_next_main, _ = self.policy(next_states[non_final_mask], 
                                                dict(action=action_batch[non_final_mask], lstm_h=None, lstm_c=None))
