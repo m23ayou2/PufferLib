@@ -62,11 +62,11 @@ BUFF_BATCH = 8
 GAMMA = 0.99
 EPS_START = 0.9
 EPS_END = 0.01
-EPS_DECAY = 20_000
+EPS_DECAY = 100_000
 TAU = 0.005
 LR = 3e-4
 nbr_games = 250
-BUFFER_EPS = 1# 0.01
+BUFFER_EPS = 0.01
 CAPACITY = 5
 OMEGA = 0.6
 CLIP_MIN = -1
@@ -226,7 +226,7 @@ class PuffeRL:
         self.beta = 0.4
         self.horizon = horizon
         self.device = device
-        self.priorities = torch.zeros(self.segments , horizon).to(self.device) + BUFFER_EPS
+        self.priorities = torch.zeros(self.segments * horizon).to(self.device) + BUFFER_EPS
         self.criterion = nn.SmoothL1Loss()
 
 
@@ -282,37 +282,42 @@ class PuffeRL:
 
 
     def sample(self, batch_size):
-        # Normalize priorities properly
-        probs = self.priorities.reshape(-1) # ** self.alpha
-        samples = torch.multinomial(probs, batch_size, replacement=True)
+        # Flattened priorities and buffer
+        flat_prios = self.priorities.reshape(-1) ** self.alpha
+        # Avoid sampling from completely-zero (invalid) entries: add tiny eps already in priorities
+        flat_prios = flat_prios.clamp_min(1e-8)
     
-        # Calculate next indices, handling buffer wrap-around
-        n_row = self.horizon
-        n_col = MEM_SIZE
-        min_ = (self.ep_lengths+torch.arange(n_col, device=self.device)*n_row).reshape(-1,1).expand(n_col, n_row).reshape(-1)[samples]
-        
-        # Update samples using torch.where to get the minimum
-        samples = torch.where(samples < min_, samples, min_)
-        
-        # Calculate rolls in a similar manner
-        rolls = torch.where(samples + 1 < min_, samples + 1, min_)
-        print(rolls.max())
+        N = flat_prios.numel()
+        probs = flat_prios / flat_prios.sum()
     
-        # Get states and next states
-        states = self.observations.reshape(-1, self.ob_space)[samples]
-        next_states = self.observations.reshape(-1, self.ob_space)[rolls]
+        # Sample flat indices
+        indices = torch.multinomial(probs, batch_size, replacement=True)  # shape [batch_size]
     
-        # Get other elements
-        actions = self.actions.reshape(-1)[samples] 
-        rewards = self.rewards.reshape(-1)[samples]
-        dones = self.terminals.reshape(-1)[samples]
+        # Compute corresponding next indices (rolls) safely: if index points to last timestep in that row, clamp to same
+        # Convert flat index -> (row, t) with row = idx // horizon, t = idx % horizon
+        rows = indices // self.horizon
+        ts = indices % self.horizon
+        next_ts = torch.minimum(ts + 1, torch.tensor(self.horizon - 1, device=ts.device))
+        rolls = rows * self.horizon + next_ts
     
-
-
-        #weights = (len(self.priorities) * probs[indices]) ** (-self.beta)
-        #weights = weights / weights.max()
-
-        return states, next_states, dones, actions.unsqueeze(1), rewards, samples, rolls #, weights
+        # Gather data
+        flat_obs = self.observations.reshape(-1, self.ob_space)
+        states = flat_obs[indices]
+        next_states = flat_obs[rolls]
+    
+        flat_actions = self.actions.reshape(-1)
+        flat_rewards = self.rewards.reshape(-1)
+        flat_dones = self.terminals.reshape(-1)
+    
+        actions = flat_actions[indices]
+        rewards = flat_rewards[indices]
+        dones = flat_dones[indices]
+    
+        # Importance sampling weights (correct normalization)
+        weights = (N * probs[indices]) ** (-self.beta)
+        weights = weights / weights.max()
+    
+        return states, next_states, dones, actions.unsqueeze(1), rewards, indices, rolls, weights
 
     def update_priorities(self, samples, td_errors):
         # Corrected: Use `index` for episodes and `samples` for timesteps
@@ -335,6 +340,7 @@ class PuffeRL:
 
     def decay_epsilon(self):
         self.epsilon = self.eps_end + (self.epsilon - self.eps_end) * math.exp(-1. * self.step_count / self.eps_decay)
+        self.step_count += 1
 
     def forward(self, observation, state):
         vector_size = observation.shape[0]
@@ -419,7 +425,7 @@ class PuffeRL:
                     self.observations[batch_rows, l] = o
                 else:
                     self.observations[batch_rows, l] = o_device
-                self.priorities[batch_rows, l] = self.max_priority
+                self.priorities.reshape(-1, self.horizon)[batch_rows, l] = self.max_priority
                 self.actions[batch_rows, l] = action.long()
                 
                 self.rewards[batch_rows, l] = r
@@ -460,7 +466,6 @@ class PuffeRL:
             self.vecenv.send(action)
 
         profile('eval_misc', epoch)
-        self.step_count += 1
 
         profile.end()
         return self.stats
@@ -486,7 +491,7 @@ class PuffeRL:
             self.amp_context.__enter__()
 
 
-            state_batch, next_states, term_, action_batch, returns, index, samples = self.sample(self.minibatch_segments)
+            state_batch, next_states, term_, action_batch, returns, samples, rolls, weights = self.sample(BATCH_SIZE)
 
             
             profile('train_copy', epoch)
@@ -502,7 +507,7 @@ class PuffeRL:
             non_final_mask = non_final_mask.reshape(-1)
 
             # Compute Q values
-            next_state_values = torch.zeros(self.minibatch_segments, device=device)
+            next_state_values = torch.zeros(BATCH_SIZE, device=device)
 
 
 
@@ -521,12 +526,12 @@ class PuffeRL:
             with torch.no_grad():
                 if non_final_mask.any():
                     # Double DQN: use main network to select actions, target network to evaluate
-                    q_next_main, _ = self.policy(next_states[non_final_mask], 
-                                               dict(action=action_batch[non_final_mask], lstm_h=None, lstm_c=None))
-                    next_actions = torch.argmax(q_next_main, dim=1, keepdim=True)
-                    
+                    q_next_main, _ = self.policy(next_states[non_final_mask],
+                                                 dict(action=action_batch[non_final_mask], lstm_h=None, lstm_c=None))
+                    next_actions = torch.argmax(q_next_main, dim=1, keepdim=True)  # shape [n_non_final,1]
+            
                     q_next_target, _ = self.target(next_states[non_final_mask],
-                                                 dict(action=next_actions, lstm_h=None, lstm_c=None))
+                                                   dict(action=next_actions, lstm_h=None, lstm_c=None))
                     next_state_values[non_final_mask] = q_next_target.gather(1, next_actions).squeeze()
 
             expected_state_action_values = (next_state_values * GAMMA) + returns
@@ -535,11 +540,13 @@ class PuffeRL:
                 
             #
             # Compute loss
-            loss = self.criterion(state_action_values.squeeze(1), expected_state_action_values.detach())
-            #td_errors = (weights.view(-1) * self.criterion(state_action_values, expected_state_action_values.detach())).mean()
+            loss = (F.smooth_l1_loss(state_action_values.squeeze(1),
+                                            expected_state_action_values.detach(),
+                                            reduction='none')).mean()
+            td_errors = (weights.view(-1) * torch.abs(state_action_values.squeeze(1) - expected_state_action_values.detach()))
 
             # Update priorities
-            #self.update_priorities(samples, td_errors.detach())
+            self.update_priorities(samples, td_errors.detach())
 
             # Optimization step
             
@@ -1355,7 +1362,6 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
 
 
