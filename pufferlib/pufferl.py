@@ -289,7 +289,7 @@ class PuffeRL:
         # Calculate next indices, handling buffer wrap-around
         n_row = self.horizon
         n_col = MEM_SIZE
-        min_ = (self.ep_lengths+torch.arange(n_col, device=self.device)*n_col).reshape(-1,1).expand(n_col, n_row).reshape(-1)[samples]
+        min_ = (self.ep_lengths+torch.arange(n_col, device=self.device)*n_row).reshape(-1,1).expand(n_col, n_row).reshape(-1)[samples]
         
         # Update samples using torch.where to get the minimum
         samples = torch.where(samples < min_, samples, min_)
