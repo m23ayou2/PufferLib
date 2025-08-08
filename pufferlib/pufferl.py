@@ -296,6 +296,7 @@ class PuffeRL:
         
         # Calculate rolls in a similar manner
         rolls = torch.where(samples + 1 < min_, samples + 1, min_)
+        print(rolls.max())
     
         # Get states and next states
         states = self.observations.reshape(-1, self.ob_space)[samples]
