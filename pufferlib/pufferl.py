@@ -323,7 +323,7 @@ class PuffeRL:
             target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
     def hard_update_target(self):
         """Hard update of target network"""
-        self.target_network.load_state_dict(self.policy.state_dict())
+        self.target.load_state_dict(self.policy.state_dict())
 
     def get_len(self):
         return self.size
@@ -337,14 +337,18 @@ class PuffeRL:
 
     def forward(self, observation, state):
         vector_size = observation.shape[0]
-        random_vector = torch.rand(vector_size).to(self.device) > self.epsilon
-        actions = torch.from_numpy(np.random.choice(self.action_space, vector_size)).to(self.device)
-        output = self.next_action(observation, state)
-        actions[random_vector] = output[random_vector]
-
-
+        exploit_mask = torch.rand(vector_size, device=self.device) > self.epsilon  # Use policy when True
+        
+        # Start with random actions
+        actions = torch.randint(0, len(self.action_space), (vector_size,), device=self.device)
+        
+        # Replace with policy actions where exploit_mask is True
+        if exploit_mask.any():
+            q_vals, _ = self.policy.forward_eval(observation, state)
+            policy_actions = torch.argmax(q_vals, dim=1)
+            actions[exploit_mask] = policy_actions[exploit_mask]
+        
         return actions
-
 
 
 
@@ -513,13 +517,16 @@ class PuffeRL:
 
             state_action_values = q_values.gather(1, action_batch)
 
-            with torch.no_grad():
-                if non_final_mask.any():
-                    #print(next_states[non_final_mask].shape)
-                    #print(state['action'].shape)
-                    state_ = dict(action=action_batch[non_final_mask], lstm_h=None, lstm_c=None)
-                    q_next, new_value = self.target(next_states[non_final_mask], state_)
-                    next_state_values[non_final_mask] = q_next.squeeze(1).max(1).values
+            if non_final_mask.any():
+                with torch.no_grad():
+                    # Double DQN: use main network to select actions, target network to evaluate
+                    q_next_main, _ = self.policy(next_states[non_final_mask], 
+                                               dict(action=action_batch[non_final_mask], lstm_h=None, lstm_c=None))
+                    next_actions = torch.argmax(q_next_main, dim=1, keepdim=True)
+                    
+                    q_next_target, _ = self.target(next_states[non_final_mask],
+                                                 dict(action=next_actions, lstm_h=None, lstm_c=None))
+                    next_state_values[non_final_mask] = q_next_target.gather(1, next_actions).squeeze()
 
             expected_state_action_values = (next_state_values * GAMMA) + returns
 
