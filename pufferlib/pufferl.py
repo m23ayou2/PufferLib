@@ -287,28 +287,39 @@ class PuffeRL:
 
     def sample(self, batch_size):
         # Normalize priorities properly
-        probs = self.priorities.reshape(-1)  ** self.alpha
-        indices = torch.multinomial(probs, batch_size, replacement=True)
+        probs = self.priorities.reshape(-1) # ** self.alpha
+        samples = torch.multinomial(probs, batch_size, replacement=True)
     
         # Calculate next indices, handling buffer wrap-around
-        max_idx = self.priorities.numel() - 1
-        next_indices = torch.where(indices < max_idx, indices + 1, indices)
+        n_rows = self.horizon
+        n_col = MEM_SIZE
+        min1 = (self.ep_ep_lengths + torch.arange(n_row, device=self.device) * n_col)[samples // n_col]
+        min2 = (samples // n_col) * n_col + n_col - 1
+        
+        # Determine the minimum value using torch.where
+        min_val = torch.where(min1 < min2, min1, min2)
+        
+        # Update samples using torch.where to get the minimum
+        samples = torch.where(samples < min_val, samples, min_val)
+        
+        # Calculate rolls in a similar manner
+        rolls = torch.where(samples + n_rolls < min_val, samples + n_rolls, min_val)
     
         # Get states and next states
-        states = self.observations.view(-1, self.ob_space)[indices]
-        next_states = self.observations.view(-1, self.ob_space)[next_indices]
+        states = self.observations.view(-1, self.ob_space)[samples]
+        next_states = self.observations.view(-1, self.ob_space)[rolls]
     
         # Get other elements
-        actions = self.actions.view(-1)[indices] 
-        rewards = self.rewards.view(-1)[indices]
-        dones = self.terminals.view(-1)[indices]
+        actions = self.actions.view(-1)[samples] 
+        rewards = self.rewards.view(-1)[samples]
+        dones = self.terminals.view(-1)[samples]
     
 
 
-        weights = (len(self.priorities) * probs[indices]) ** (-self.beta)
-        weights = weights / weights.max()
+        #weights = (len(self.priorities) * probs[indices]) ** (-self.beta)
+        #weights = weights / weights.max()
 
-        return states, next_states, dones, actions.unsqueeze(1), rewards, indices, next_indices, weights
+        return states, next_states, dones, actions.unsqueeze(1), rewards, samples, rolls, weights
 
     def update_priorities(self, samples, td_errors):
         # Corrected: Use `index` for episodes and `samples` for timesteps
@@ -525,10 +536,10 @@ class PuffeRL:
             #
             # Compute loss
             loss = self.criterion(state_action_values.squeeze(1), expected_state_action_values.detach())
-            td_errors = (weights.view(-1) * self.criterion(state_action_values, expected_state_action_values.detach())).mean()
+            #td_errors = (weights.view(-1) * self.criterion(state_action_values, expected_state_action_values.detach())).mean()
 
             # Update priorities
-            self.update_priorities(samples, td_errors.detach())
+            #self.update_priorities(samples, td_errors.detach())
 
             # Optimization step
             
