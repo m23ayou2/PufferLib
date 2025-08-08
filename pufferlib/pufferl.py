@@ -298,13 +298,13 @@ class PuffeRL:
         rolls = torch.where(samples + 1 < min_, samples + 1, min_)
     
         # Get states and next states
-        states = self.observations.view(-1, self.ob_space)[samples]
-        next_states = self.observations.view(-1, self.ob_space)[rolls]
+        states = self.observations.reshape(-1, self.ob_space)[samples]
+        next_states = self.observations.reshape(-1, self.ob_space)[rolls]
     
         # Get other elements
-        actions = self.actions.view(-1)[samples] 
-        rewards = self.rewards.view(-1)[samples]
-        dones = self.terminals.view(-1)[samples]
+        actions = self.actions.reshape(-1)[samples] 
+        rewards = self.rewards.reshape(-1)[samples]
+        dones = self.terminals.reshape(-1)[samples]
     
 
 
