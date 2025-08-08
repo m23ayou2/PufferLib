@@ -293,17 +293,13 @@ class PuffeRL:
         # Calculate next indices, handling buffer wrap-around
         n_rows = self.horizon
         n_col = MEM_SIZE
-        min1 = (self.ep_ep_lengths + torch.arange(n_row, device=self.device) * n_col)[samples // n_col]
-        min2 = (samples // n_col) * n_col + n_col - 1
-        
-        # Determine the minimum value using torch.where
-        min_val = torch.where(min1 < min2, min1, min2)
+        min = (self.ep_lengths.reshape(-1,1).expand(n_col, n_row)[samples]
         
         # Update samples using torch.where to get the minimum
-        samples = torch.where(samples < min_val, samples, min_val)
+        samples = torch.where(samples < min, samples, min)
         
         # Calculate rolls in a similar manner
-        rolls = torch.where(samples + n_rolls < min_val, samples + n_rolls, min_val)
+        rolls = torch.where(samples + 1 < min, samples + 1, min)
     
         # Get states and next states
         states = self.observations.view(-1, self.ob_space)[samples]
